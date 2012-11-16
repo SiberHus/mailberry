@@ -1,0 +1,33 @@
+<?xml version="1.0" ?>
+<list>
+	<subscriber>
+		<email>donald@test.com</email>
+		<firstName>Donald </firstName>
+		<lastName>Duck </lastName>
+		<status>ACT</status>
+	</subscriber>
+	<subscriber>
+		<email>mickey@test.com</email>
+		<firstName>Mickey</firstName>
+		<lastName>Mouse</lastName>
+		<status>ACT</status>
+	</subscriber>
+	<subscriber>
+		<email>badger@test.com</email>
+		<firstName>Badger</firstName>
+		<status>INA</status>
+	</subscriber>
+	<subscriber>
+		<email>minnie@test.com</email>
+		<firstName>Minnie</firstName>
+		<lastName>Mouse</lastName>
+		<status>ACT</status>
+	</subscriber>
+	<subscriber>
+		<email>pluto@test.com</email>
+		<firstName>Pluto</firstName>
+		<lastName>Dog</lastName>
+		<breed>Bloodhound</breed>
+		<status>ACT</status>
+	</subscriber>
+</list>

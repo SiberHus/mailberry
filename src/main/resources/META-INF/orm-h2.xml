@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<entity-mappings xmlns="http://java.sun.com/xml/ns/persistence/orm"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://java.sun.com/xml/ns/persistence/orm
+	http://java.sun.com/xml/ns/persistence/orm_2_0.xsd"
+	version="2.0">
+	
+	<entity class="com.siberhus.mailberry.model.Campaign">
+		<attribute-override name="messageBodyText">
+			<column column-definition="CLOB"/>
+		</attribute-override>
+		<attribute-override name="messageBodyHtml">
+			<column column-definition="CLOB"/>
+		</attribute-override>
+	</entity>
+	
+	<entity class="com.siberhus.mailberry.model.MessageTemplate">
+		<attribute-override name="templateTextData">
+			<column column-definition="CLOB"/>
+		</attribute-override>
+		<attribute-override name="templateHtmlData">
+			<column column-definition="CLOB"/>
+		</attribute-override>
+	</entity>
+	
+	<entity class="com.siberhus.mailberry.model.TemplateChunk">
+		<attribute-override name="value">
+			<column column-definition="CLOB"/>
+		</attribute-override>
+	</entity>
+	
+	<entity class="com.siberhus.mailberry.model.CustomPage">
+		<attribute-override name="content">
+			<column column-definition="CLOB"/>
+		</attribute-override>
+	</entity>
+	
+</entity-mappings>

@@ -1,0 +1,740 @@
+package com.siberhus.mailberry.service.impl;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.StringReader;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.inject.Inject;
+import javax.mail.Message.RecipientType;
+import javax.mail.MessagingException;
+import javax.mail.internet.MimeMessage;
+import javax.persistence.EntityManager;
+import javax.persistence.EntityManagerFactory;
+import javax.persistence.NoResultException;
+import javax.persistence.PersistenceContext;
+import javax.persistence.PersistenceUnit;
+
+import org.apache.commons.lang.RandomStringUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.text.StrLookup;
+import org.apache.commons.lang.text.StrSubstitutor;
+import org.apache.velocity.app.VelocityEngine;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.mail.MailSendException;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.JavaMailSenderImpl;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.ui.velocity.VelocityEngineUtils;
+import org.springframework.util.Assert;
+
+import com.siberhus.mailberry.Config;
+import com.siberhus.mailberry.ServiceUri;
+import com.siberhus.mailberry.dao.BlacklistDao;
+import com.siberhus.mailberry.dao.SubscriberDao;
+import com.siberhus.mailberry.dao.TemplateChunkDao;
+import com.siberhus.mailberry.dao.TemplateVariableDao;
+import com.siberhus.mailberry.exception.DuplicateRequestException;
+import com.siberhus.mailberry.model.Attachment;
+import com.siberhus.mailberry.model.Campaign;
+import com.siberhus.mailberry.model.Campaign.MessageType;
+import com.siberhus.mailberry.model.SmtpProfile;
+import com.siberhus.mailberry.model.Subscriber;
+import com.siberhus.mailberry.model.SubscriberList;
+import com.siberhus.mailberry.model.TemplateChunk;
+import com.siberhus.mailberry.model.TemplateVariable;
+import com.siberhus.mailberry.service.CampaignService;
+import com.siberhus.mailberry.service.ConfigurationService;
+import com.siberhus.mailberry.service.EmailService;
+import com.siberhus.mailberry.service.TrackingService;
+import com.siberhus.mailberry.service.pojo.EmailMessage;
+import com.siberhus.mailberry.service.pojo.FilledEmailMessage;
+import com.siberhus.mailberry.service.pojo.TemplateEmailMessage;
+import com.siberhus.mailberry.util.HtmlMessageInterceptor;
+import com.siberhus.mailberry.util.ThreadLocalEntityManager;
+import com.siberhus.mailberry.util.ZipUtils;
+
+@Service
+//@Scope("prototype")
+public class EmailServiceImpl implements EmailService{
+
+	private final Logger log = LoggerFactory.getLogger(EmailServiceImpl.class);
+	
+	@PersistenceContext
+	private EntityManager em;
+	
+	@PersistenceUnit
+	private EntityManagerFactory emf;
+	
+	@Inject
+	private VelocityEngine velocityEngine;
+	
+	@Inject
+	private SubscriberDao subscriberDao;
+	
+	@Inject
+	private TemplateChunkDao templateChunkDao;
+	
+	@Inject
+	private TemplateVariableDao templateVarDao;
+	
+	@Inject
+	private BlacklistDao blacklistDao;
+	
+	@Inject
+	private CampaignService campaignService;
+	
+	@Inject
+	private TrackingService trackingService;
+	
+	@Inject
+	private ConfigurationService configService;
+	
+	
+	private static final ConcurrentHashMap<Long, Integer> PROGRESSES = new ConcurrentHashMap<Long, Integer>();
+	private static final ConcurrentHashMap<Long, EmailTimer> SCHEDULERS = new ConcurrentHashMap<Long, EmailTimer>();
+	private static final ConcurrentHashMap<Long, Boolean> STOP_SIGNALS = new ConcurrentHashMap<Long, Boolean>();
+	
+	@Override
+	public int getProgress(Long campaignId){
+		Campaign campaign = campaignService.get(campaignId);
+		Assert.notNull(campaign);
+		Integer progress = PROGRESSES.get(campaignId);
+		if(progress==null){
+			if(Campaign.Status.SENT.equals(campaign.getStatus())){
+				return 100;
+			}else{
+				return 0;
+			}
+		}
+		return progress;
+	}
+	
+	@Override
+	public void sendTest(Long campaignId, String email) throws MessagingException {
+		
+		Campaign campaign = campaignService.get(campaignId);
+		Assert.notNull(campaign);
+		
+		JavaMailSender sender = createJavaMailSender(campaign);
+		TemplateEmailMessage templateEmailMessage = createEmailMessage(campaign);
+		MimeMessage message = sender.createMimeMessage();
+		if(templateEmailMessage.getUserAgent()!=null){
+			message.setHeader("User-Agent", templateEmailMessage.getUserAgent());
+		}
+		MimeMessageHelper helper = new MimeMessageHelper(message, templateEmailMessage.isMultipart());
+		if(campaign.getMailPriority()!=null) helper.setPriority(campaign.getMailPriority());
+		//Set Test Email
+		helper.setTo(email);
+		helper.setFrom(templateEmailMessage.getFromEmail());
+		helper.setReplyTo(templateEmailMessage.getReplyToEmail());
+		helper.setSubject(templateEmailMessage.getMailSubject());
+		if(campaign.getMessageType()==MessageType.MIX){
+			helper.setText(templateEmailMessage.getMessageBodyText(), templateEmailMessage.getMessageBodyHtml());
+		}else if(campaign.getMessageType()==MessageType.TEXT){
+			helper.setText(templateEmailMessage.getMessageBodyText(), false);
+		}else if(campaign.getMessageType()==MessageType.HTML){
+			helper.setText(templateEmailMessage.getMessageBodyHtml(), true);
+		}
+		
+		addAttachments(helper, templateEmailMessage);
+		
+		sender.send(message);
+	}
+	
+	@Override
+	public void sendTest(Long campaignId) throws MessagingException {
+		
+		Campaign campaign = campaignService.get(campaignId);
+		Assert.notNull(campaign);
+		
+		JavaMailSender sender = createJavaMailSender(campaign);
+		TemplateEmailMessage templateEmailMessage = createEmailMessage(campaign);
+		SubscriberList list = campaign.getList();
+		
+		List<Subscriber> subscriberList = subscriberDao
+			.findAllByStatusFromList(list, Subscriber.Status.TEST);
+		if(subscriberList.size()==0){
+			throw new NoResultException("No test data");
+		}
+		MimeMessage messages[] = new MimeMessage[subscriberList.size()];
+		for(int i=0;i<messages.length;i++){
+			Subscriber subscriber = subscriberList.get(i);
+			MimeMessage message = createPersonalizedEmail(sender, campaign, 
+					templateEmailMessage, subscriber);
+			messages[i] = message;
+		}
+		
+		sender.send(messages);
+		
+	}
+	
+	/**
+	 * This is long-running method, so it have to manages its own transaction and keep it as short
+	 * as possible otherwise transaction timeout will be raised.
+	 */
+	@Override
+	public void sendNow(final Long campaignId) throws MessagingException {
+		
+		Campaign campaign_ = campaignService.get(campaignId);
+		Assert.notNull(campaign_);
+		
+		final ThreadLocalEntityManager threadLocalEm = new ThreadLocalEntityManager(emf);
+		EntityManager em = threadLocalEm.get();// hide instance variable.
+		
+		threadLocalEm.beginTransaction();
+		
+		final Campaign campaign = em.merge(campaign_);
+		if(PROGRESSES.contains(campaignId)){
+			throw new DuplicateRequestException("Campaign: "+campaignId+" is in progress");
+		}
+		PROGRESSES.put(campaignId, 0);
+		
+		if(!Campaign.Status.DRAFT.equals(campaign.getStatus())
+				&& !Campaign.Status.SCHEDULED.equals(campaign.getStatus())){
+			throw new IllegalStateException("Campaign: "+campaignId+" was sent or scheduled ");
+		}
+		campaign.setStatus(Campaign.Status.IN_PROGRESS);
+		campaign.setStartSendingTime(new Date());
+		em.flush();
+		
+		threadLocalEm.commitTransaction();
+		
+		final JavaMailSender sender = createJavaMailSender(campaign);
+		final Stat stat = new Stat();
+		final TemplateEmailMessage templateEmailMessage = createEmailMessage(campaign);
+		final SubscriberList list = campaign.getList();
+		
+		List<Long> subscriberIdList = subscriberDao
+			.getAllIdsByStatusFromList(list, Subscriber.Status.ACTIVE);
+		
+		final int numberOfThread = configService.getValue(
+				Config.Email.Sending.NUMBER_OF_THREADS, Integer.class);
+		final int messagesPerConnection = configService.getValue(Config.Email.Sending
+				.MESSAGES_PER_CONNECTION, Integer.class);
+		final int numberOfAttempts = configService.getValue(Config.Email.Sending
+				.NUMBER_OF_ATTEMPTS, Integer.class);
+		final int pauseBetweenAttemps = configService.getValue(Config.Email.Sending
+				.PAUSE_BETWEEN_ATTEMPTS, Integer.class);
+		final int pauseBetweenMessages = configService.getValue(Config.Email.Sending
+				.PAUSE_BETWEEN_MESSAGES, Integer.class);
+		final boolean blockOnFail = configService.getValue(Config.Email.Sending
+				.BLOCK_ON_FAIL, Boolean.class);
+		
+		final int subscriberCount = subscriberIdList.size();
+		int roundCount = (int)Math.ceil(subscriberCount/new Double(messagesPerConnection));
+		final CountDownLatch doneSignal = new CountDownLatch(roundCount);
+		ExecutorService executor = Executors.newFixedThreadPool(numberOfThread);
+//		executor = Executors.newSingleThreadExecutor();//for basic edition
+		
+		for(int i=0; i<subscriberIdList.size(); i+=messagesPerConnection){
+			
+			final List<Long> subIdList = new ArrayList<Long>();
+			for(int j=0;j<messagesPerConnection;j++){
+				if( (i+j) < subscriberIdList.size()){
+					subIdList.add(subscriberIdList.get(i+j));
+				}
+			}
+			
+			executor.execute(new Runnable(){
+				@Override
+				public void run() {
+					if(STOP_SIGNALS.get(campaignId)!=null){
+						return;
+					}
+					try{
+						
+						EntityManager beanManagedEm = threadLocalEm.get();
+						threadLocalEm.beginTransaction();
+						Map<Object, Exception> failedMsgMap = null;
+						Collection<MimeMessage> messages = new ArrayList<MimeMessage>();
+						for(int i=0; i< subIdList.size(); i++){
+							Long subscriberId = subIdList.get(i);
+							Subscriber subscriber = beanManagedEm.find(Subscriber.class, subscriberId);
+							
+							trackingService.createTracking(campaignId, subscriber);
+							
+							if(templateEmailMessage.getBlacklist()!=null){
+								if(templateEmailMessage.getBlacklist().contains(subscriber.getEmail())){
+									log.debug("Skip email: {} because it's in global block list", subscriber.getEmail());
+									continue;
+								}
+							}
+							
+							MimeMessage message = createPersonalizedEmail(sender, campaign, templateEmailMessage, subscriber);
+							messages.add(message);
+						}
+						
+						log.trace("Thread ID: {}, EntityManager: {}", new Object[]{
+								Thread.currentThread().getId(), beanManagedEm});
+						log.info("Sending campaign: {} to subscribers: {}"
+							, new Object[]{campaign.getId(), subIdList});
+						try{
+							sender.send(messages.toArray(new MimeMessage[0]));
+						}catch(MailSendException e){
+							failedMsgMap = e.getFailedMessages();
+							for(int i=0;i<numberOfAttempts;i++){
+								Set<Object> failedMessages = failedMsgMap.keySet();
+								try{
+									sender.send(failedMessages.toArray(new MimeMessage[0]));
+									failedMessages = null;
+									break;
+								}catch(MailSendException e2){
+									failedMsgMap = e2.getFailedMessages();
+									if(pauseBetweenAttemps>0){
+										Thread.sleep(pauseBetweenAttemps*1000);
+									}
+									continue;
+								}
+							}
+//							messages[0].getRecipients(RecipientType.TO).toString();
+						}
+						
+						int total = messages.size();
+						int failures = 0;
+						if(failedMsgMap!=null){
+							failures = failedMsgMap.size();
+							for(Map.Entry<Object, Exception> msgEntry: failedMsgMap.entrySet()){
+								MimeMessage message = (MimeMessage)msgEntry.getKey();
+								Exception error = msgEntry.getValue();
+								String failedEmail = message.getRecipients(RecipientType.TO)[0].toString();
+								Subscriber failedSubscriber = subscriberDao.findByEmailFromList(list, failedEmail);
+								if(failedSubscriber!=null){
+									trackingService.setErrorResult(campaignId, failedSubscriber.getId(), error);
+									if(blockOnFail){
+										failedSubscriber.setStatus(Subscriber.Status.BLOCKED);
+									}
+								}else{
+									log.error("Cannot find failed subscriber:{}", failedEmail);
+								}
+							}
+						}
+						
+						int successes = total-failures;
+						int totalSuccess = stat.successCount.addAndGet(successes);
+						int totalFailure = stat.failureCount.addAndGet(failures);
+						int progress = (int)( ((totalSuccess+totalFailure) * 100)/ subscriberCount);
+						PROGRESSES.put(campaign.getId(), progress);
+						
+						beanManagedEm.flush();
+						beanManagedEm.clear();
+						threadLocalEm.commitTransaction();
+					}catch(Exception e){
+						log.error(e.getMessage(), e);
+						threadLocalEm.rollbackTransaction();
+					}finally{
+						doneSignal.countDown();
+					}
+					if(pauseBetweenMessages>0){
+						try{
+							Thread.sleep(pauseBetweenMessages*1000);
+						}catch(Exception e){}
+					}
+				}// END RUN
+			});
+		}//END FOR
+		
+		log.info("Waing for {} tasks be done.", subscriberCount);
+		try {
+			doneSignal.await();
+		} catch (InterruptedException e) {
+			log.error(e.getMessage(), e);
+		}
+		
+		log.info("Shutdown email executor service");
+		try{
+			executor.shutdown();
+		}catch(Exception e){
+			log.error(e.getMessage(), e);
+		}
+		
+		threadLocalEm.beginTransaction();
+		
+		campaign.setStatus(Campaign.Status.SENT);
+		campaign.setFinishSendingTime(new Date());
+		PROGRESSES.remove(campaignId);
+		STOP_SIGNALS.remove(campaignId);
+		//Update MailServer Profile Stat
+		SmtpProfile smtpProfile = campaign.getSmtpProfile();
+		smtpProfile.setTotalSentMails(smtpProfile.getTotalSentMails()
+				+stat.successCount.intValue()+stat.failureCount.intValue());
+		smtpProfile.setSuccessfulMails(smtpProfile.getSuccessfulMails()
+				+stat.successCount.intValue());
+		smtpProfile.setFailedMails(smtpProfile.getFailedMails()
+				+stat.failureCount.intValue());
+		
+		threadLocalEm.commitTransaction();
+		threadLocalEm.close();
+		
+	}
+	
+	private JavaMailSender createJavaMailSender(Campaign campaign){
+		
+		JavaMailSenderImpl sender = new JavaMailSenderImpl();
+		SmtpProfile smtpProfile = campaign.getSmtpProfile();
+		Properties mailProps = new Properties();
+		if(smtpProfile.getMailProperties()!=null){
+			mailProps = new Properties();
+			try {
+				mailProps.load(new StringReader(smtpProfile.getMailProperties()));
+			} catch (IOException e) {/*No IOException for StringReader*/}
+		}
+		sender.setJavaMailProperties(mailProps);
+		sender.setHost(smtpProfile.getMailHost());
+		sender.setProtocol("smtp");
+		sender.setPort(smtpProfile.getMailPort());
+		sender.setDefaultEncoding(campaign.getMessageCharset());
+		if(smtpProfile.isAuthen()){
+			mailProps.setProperty("mail.smtp.auth", "true");
+			sender.setUsername(smtpProfile.getMailUser());
+			sender.setPassword(smtpProfile.getMailPassword());
+		}
+		if(smtpProfile.isSsl()){
+			sender.setProtocol("smtps");
+			mailProps.setProperty("mail.smtp.starttls.enable", "true");
+		}
+		if(smtpProfile.getTimeout()!=null){
+			mailProps.setProperty("mail.smtp.timeout", smtpProfile.getTimeout().toString());
+		}
+		return sender;
+	}
+	
+	
+	private MimeMessage createPersonalizedEmail(JavaMailSender sender, Campaign campaign, 
+			TemplateEmailMessage templateEmailMessage, Subscriber subscriber) throws MessagingException{
+		
+		
+		
+		MimeMessage message = sender.createMimeMessage();
+		if(templateEmailMessage.getUserAgent()!=null){
+			message.setHeader("User-Agent", templateEmailMessage.getUserAgent());
+		}
+		
+		MimeMessageHelper helper = new MimeMessageHelper(message, templateEmailMessage.isMultipart());
+		
+		FilledEmailMessage filledEmailMessage = fillUpEmailMessage(campaign, templateEmailMessage, subscriber);
+		if(campaign.getMailPriority()!=null) helper.setPriority(campaign.getMailPriority());
+		helper.setTo(filledEmailMessage.getToEmail());
+		helper.setFrom(filledEmailMessage.getFromEmail());
+		helper.setReplyTo(filledEmailMessage.getReplyToEmail());
+		helper.setSubject(filledEmailMessage.getMailSubject());
+		
+		if(campaign.getMessageType()==MessageType.MIX){
+			helper.setText(filledEmailMessage.getMessageBodyText(), filledEmailMessage.getMessageBodyHtml());
+		}else if(campaign.getMessageType()==MessageType.TEXT){
+			helper.setText(filledEmailMessage.getMessageBodyText(), false);
+		}else if(campaign.getMessageType()==MessageType.HTML){
+			helper.setText(filledEmailMessage.getMessageBodyHtml(), true);
+		}
+
+		addAttachments(helper, filledEmailMessage);
+		
+		return message;
+	}
+	
+	
+	private void addAttachments(MimeMessageHelper helper, EmailMessage emailMessage) throws MessagingException{
+		List<Attachment> attachments = emailMessage.getAttachments();
+		if(attachments!=null){
+			for(Attachment attachment: attachments){
+				File attachedFile = new File(attachment.getFilePath());
+				if(attachedFile.exists()){
+					if(attachment.isCompressed()){
+						String rand = RandomStringUtils.randomAlphanumeric(5);
+						SimpleDateFormat sdf = new SimpleDateFormat("MMddmmHHssSSS");
+						String tmpDirStr = configService.getValueAsString(Config.TMP_DIR);
+						String generatedName = sdf.format(new Date())+"_"+rand+".zip";
+						File archivedFile = new File(tmpDirStr+generatedName);
+						try{
+							if(attachment.getArchivePasswd()!=null){
+								ZipUtils.zipFile(attachedFile, archivedFile, attachment.getArchivePasswd());
+							}else{
+								ZipUtils.zipFile(attachedFile, archivedFile);
+							}
+						}catch(IOException e){
+							log.error("Unable to create zip file: "+archivedFile, e);
+						}
+						helper.addAttachment(attachment.getFileName(), archivedFile);
+					}else{
+						if(attachedFile.isFile()){
+							helper.addAttachment(attachment.getFileName(), attachedFile);
+						}else{
+							log.error("Cannot attach folder, you must compress it before sending.");
+						}
+					}
+				}else{
+					log.error("Unable to find attachment: "+attachedFile);
+				}
+			}
+		}
+	}
+	
+	@Transactional
+	@Override
+	public void scheduleDelivery(final Long campaignId, Date time) {
+		Campaign campaign = campaignService.get(campaignId);
+		Assert.notNull(campaign);
+		if(time.getTime()-new Date().getTime()<5000){
+			throw new IllegalArgumentException("time must be future");
+		}
+		EmailTimer timer = new EmailTimer(true);
+		campaign.setStatus(Campaign.Status.SCHEDULED);
+		campaign.setScheduledTime(time);
+		em.merge(campaign);
+		TimerTask senderTask = new TimerTask(){
+			@Override
+			public void run() {
+				try {
+					sendNow(campaignId);
+				} catch (Exception e) {
+					log.error(e.getMessage() ,e);
+				}
+				SCHEDULERS.remove(campaignId);
+			}
+		};
+		timer.schedule(senderTask, time);
+		SCHEDULERS.put(campaignId, timer);
+	}
+	
+	@Transactional
+	@Override
+	public boolean cancelDelivery(Long campaignId){
+		Campaign campaign = campaignService.get(campaignId);
+		Assert.notNull(campaign);
+		if(Campaign.Status.IN_PROGRESS.equals(campaign.getStatus())){
+			campaign.setStatus(Campaign.Status.CANCELLED);
+			STOP_SIGNALS.put(campaign.getId(), true);
+		}else if(Campaign.Status.SCHEDULED.equals(campaign.getStatus())){
+			campaign.setStatus(Campaign.Status.DRAFT);
+			campaign.setScheduledTime(null);
+		}
+		Timer timer = SCHEDULERS.get(campaignId);
+		if(timer!=null){
+			timer.cancel();
+			SCHEDULERS.remove(campaignId);
+			return true;
+		}
+		return false;
+	}
+	
+	@Override
+	public TemplateEmailMessage createEmailMessage(Campaign campaign) {
+		
+		TemplateEmailMessage emailMessage = new TemplateEmailMessage();
+		if(campaign.isInlineResource() 
+				|| campaign.getMessageType()==MessageType.MIX 
+				|| campaign.getAttachments()!=null){
+			emailMessage.setMultipart(true);
+		}
+		String mailUserAgent = configService.getValueAsString(Config.Email.MAIL_USER_AGENT);
+		emailMessage.setUserAgent(mailUserAgent);
+		
+		List<TemplateVariable> templateVars = templateVarDao.findAllByStatus(TemplateVariable.Status.ACTIVE);
+		Map<String, String> msgVarMap = new HashMap<String, String>();
+		for(TemplateVariable templateVar: templateVars){
+			msgVarMap.put(templateVar.getName(), templateVar.getValue());
+		}
+		final StrSubstitutor msgVarSub = new StrSubstitutor(msgVarMap, "$(", ")");
+		StrSubstitutor msgChunkSub = new StrSubstitutor(new StrLookup() {
+			@Override
+			public String lookup(String key) {
+				String value = null;
+				try{
+					value = templateChunkDao.getValueByNameAndStatus(key, TemplateChunk.Status.ACTIVE);
+					return msgVarSub.replace(value);
+				}catch(Exception e){
+					log.error("Unable to find key={} in template chunk", key);
+					return "";
+				}
+			}
+		}, "$[", "]", StrSubstitutor.DEFAULT_ESCAPE);
+		emailMessage.setFromEmail(msgVarSub.replace(campaign.getFromEmail()));
+		String replyToEmail = campaign.getReplyToEmail();
+		if(StringUtils.isBlank(replyToEmail)){
+			replyToEmail = emailMessage.getFromEmail();
+		}else{
+			replyToEmail = msgVarSub.replace(campaign.getReplyToEmail());
+		}
+		emailMessage.setReplyToEmail(replyToEmail);
+		emailMessage.setMailSubject(msgVarSub.replace(campaign.getMailSubject()));
+		
+		if(campaign.getMessageType()==Campaign.MessageType.MIX
+				|| campaign.getMessageType()==Campaign.MessageType.TEXT){
+			String value = msgVarSub.replace(campaign.getMessageBodyText());
+			value = msgChunkSub.replace(value);
+			emailMessage.setMessageBodyText(value);
+		}
+		if(campaign.getMessageType()==Campaign.MessageType.MIX
+				|| campaign.getMessageType()==Campaign.MessageType.HTML){
+			String value = msgVarSub.replace(campaign.getMessageBodyHtml());
+			value = msgChunkSub.replace(value);
+			emailMessage.setMessageBodyHtml(value);
+		}
+		List<Attachment> attachments = campaign.getAttachments();
+		if(attachments!=null){
+			attachments = new ArrayList<Attachment>(attachments);
+			for(Attachment attachment: attachments){
+				attachment.setFileName(msgVarSub.replace(attachment.getFileName()));
+				attachment.setFilePath(msgVarSub.replace(attachment.getFilePath()));
+				attachment.setArchivePasswd(msgVarSub.replace(attachment.getArchivePasswd()));
+			}
+			emailMessage.setAttachments(attachments);
+		}
+		
+		List<?> blacklist = null;
+		if(campaign.isBlacklistEnabled()){
+			blacklist = blacklistDao.findAllEmails();
+			emailMessage.setBlacklist(blacklist);
+		}
+		
+		if(campaign.getMessageType()==MessageType.MIX
+				|| campaign.getMessageType()==MessageType.HTML){
+			//Intercept html message before filling data
+			HtmlMessageInterceptor htmlMsgInterceptor = new HtmlMessageInterceptor();
+			htmlMsgInterceptor.setClickstream(campaign.isClickstream());
+			htmlMsgInterceptor.setOpenTracking(campaign.isTrackable());
+			String htmlMessage = emailMessage.getMessageBodyHtml();
+			try {
+				htmlMessage = htmlMsgInterceptor.parse(new StringReader(htmlMessage), true).toString();
+			} catch (IOException e) {
+				log.error("HTML message interceptor error", e);
+			}
+			emailMessage.setMessageBodyHtml(htmlMessage);
+		}
+		return emailMessage;
+	}
+	
+	@Override
+	public FilledEmailMessage fillUpEmailMessage(Campaign campaign, TemplateEmailMessage emailMessage, Subscriber subscriber) {
+		
+		SubscriberList list = campaign.getList();
+		FilledEmailMessage filledEmailMessage = new FilledEmailMessage(emailMessage);
+		Map<String, String> dataVarMap = filledEmailMessage.getDataVarMap();
+		dataVarMap.put("email", subscriber.getEmail());
+		if(list.getField1Name()!=null)dataVarMap.put(list.getField1Name(),subscriber.getField1Value());
+		if(list.getField2Name()!=null)dataVarMap.put(list.getField2Name(),subscriber.getField2Value());
+		if(list.getField3Name()!=null)dataVarMap.put(list.getField3Name(),subscriber.getField3Value());
+		if(list.getField4Name()!=null)dataVarMap.put(list.getField4Name(),subscriber.getField4Value());
+		if(list.getField5Name()!=null)dataVarMap.put(list.getField5Name(),subscriber.getField5Value());
+		if(list.getField6Name()!=null)dataVarMap.put(list.getField6Name(),subscriber.getField6Value());
+		if(list.getField7Name()!=null)dataVarMap.put(list.getField7Name(),subscriber.getField7Value());
+		if(list.getField8Name()!=null)dataVarMap.put(list.getField8Name(),subscriber.getField8Value());
+		if(list.getField9Name()!=null)dataVarMap.put(list.getField9Name(),subscriber.getField9Value());
+		if(list.getField10Name()!=null)dataVarMap.put(list.getField10Name(),subscriber.getField10Value());
+		if(list.getField11Name()!=null)dataVarMap.put(list.getField11Name(),subscriber.getField11Value());
+		if(list.getField12Name()!=null)dataVarMap.put(list.getField12Name(),subscriber.getField12Value());
+		if(list.getField13Name()!=null)dataVarMap.put(list.getField13Name(),subscriber.getField13Value());
+		if(list.getField14Name()!=null)dataVarMap.put(list.getField14Name(),subscriber.getField14Value());
+		if(list.getField15Name()!=null)dataVarMap.put(list.getField15Name(),subscriber.getField15Value());
+		if(list.getField16Name()!=null)dataVarMap.put(list.getField16Name(),subscriber.getField16Value());
+		if(list.getField17Name()!=null)dataVarMap.put(list.getField17Name(),subscriber.getField17Value());
+		if(list.getField18Name()!=null)dataVarMap.put(list.getField18Name(),subscriber.getField18Value());
+		if(list.getField19Name()!=null)dataVarMap.put(list.getField19Name(),subscriber.getField19Value());
+		if(list.getField20Name()!=null)dataVarMap.put(list.getField20Name(),subscriber.getField20Value());
+		
+		//Modifies html content
+		//	* Modifies link to support clickstream
+		//	* Adds open email tracking image
+		String baseUrl = configService.getValueAsString(Config.SERVER_URL);
+		if(campaign.isClickstream()){
+			String clickstreamUrl = baseUrl+ServiceUri.CLICK_STREAM
+				+"/"+campaign.getId()+"/"+campaign.getSecurityToken()
+				+"/"+subscriber.getId()+"/";
+			dataVarMap.put("_clickstream_", clickstreamUrl);
+		}
+		if(campaign.isTrackable()){
+			String trackingUrl = baseUrl+ServiceUri.OPEN_TRACKING
+				+"/"+campaign.getId()+"/"+campaign.getSecurityToken()
+				+"/"+subscriber.getId();
+			dataVarMap.put("_openTracking_", trackingUrl);
+		}
+		
+		filledEmailMessage.setToEmail(subscriber.getEmail());
+		StrSubstitutor dataVarSub = new StrSubstitutor(dataVarMap, "${", "}");
+		filledEmailMessage.setFromEmail(dataVarSub.replace(filledEmailMessage.getFromEmail()));
+		filledEmailMessage.setReplyToEmail(dataVarSub.replace(filledEmailMessage.getReplyToEmail()));
+		filledEmailMessage.setMailSubject(dataVarSub.replace(filledEmailMessage.getMailSubject()));
+		if(campaign.isVelocity()){
+			String encoding = configService.getValueAsString(Config.Email.VELOCITY_ENCODING);
+			if(campaign.getMessageType()==MessageType.MIX
+				|| campaign.getMessageType()==MessageType.TEXT){
+				String fileName = CampaignService.FILE_PREFIX_TEXT+campaign.getMessageFile();
+				String textMessage = VelocityEngineUtils.mergeTemplateIntoString(
+						velocityEngine, fileName, encoding, dataVarMap);
+				filledEmailMessage.setMessageBodyText(textMessage);
+			}
+			if(campaign.getMessageType()==MessageType.MIX
+				|| campaign.getMessageType()==MessageType.HTML){
+				String fileName = CampaignService.FILE_PREFIX_HTML+campaign.getMessageFile();
+				String htmlMessage = VelocityEngineUtils.mergeTemplateIntoString(
+						velocityEngine, fileName, encoding, dataVarMap);
+				filledEmailMessage.setMessageBodyHtml(htmlMessage);
+			}
+		}else{
+			if(campaign.getMessageType()==MessageType.MIX
+				|| campaign.getMessageType()==MessageType.TEXT){
+				filledEmailMessage.setMessageBodyText(dataVarSub.replace(
+						filledEmailMessage.getMessageBodyText()));
+			}
+			if(campaign.getMessageType()==MessageType.MIX
+				|| campaign.getMessageType()==MessageType.HTML){
+				filledEmailMessage.setMessageBodyHtml(dataVarSub.replace(
+						filledEmailMessage.getMessageBodyHtml()));
+			}
+		}
+		List<Attachment> attachments = filledEmailMessage.getAttachments();
+		if(attachments!=null){
+			for(Attachment attachment: attachments){
+				attachment.setFileName(dataVarSub.replace(attachment.getFileName()));
+				attachment.setFilePath(dataVarSub.replace(attachment.getFilePath()));
+				attachment.setArchivePasswd(dataVarSub.replace(attachment.getArchivePasswd()));
+			}
+		}
+		
+		return filledEmailMessage;
+	}
+	
+	private static class Stat {
+		public AtomicInteger successCount = new AtomicInteger(0);
+		public AtomicInteger failureCount = new AtomicInteger(0);
+	}
+	
+	private static class EmailTimer extends Timer {
+		
+		private Date time;
+		
+		public EmailTimer(boolean isDaemon) {
+			super(isDaemon);
+		}
+		
+		@Override
+		public void schedule(TimerTask task, Date time) {
+			this.time = time;
+			super.schedule(task, time);
+		}
+		
+		@SuppressWarnings("unused")
+		public Date getTime(){
+			return time;
+		}
+	}
+	
+}

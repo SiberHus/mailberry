@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<beans:beans xmlns:beans="http://www.springframework.org/schema/beans"
+	xmlns="http://www.springframework.org/schema/security"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/security http://www.springframework.org/schema/security/spring-security-3.1.xsd
+		http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-3.1.xsd">
+	
+	<authentication-manager alias="authenticationManager">
+		<authentication-provider user-service-ref="userSecurityService">
+			<password-encoder base64="true" hash="md5" >
+				<salt-source user-property="username"/>
+			</password-encoder>
+		</authentication-provider>
+	</authentication-manager>
+	
+	<jdbc-user-service id="userSecurityService" data-source-ref="dataSource"
+		users-by-username-query="select username, password, enabled from users where username=?"
+		authorities-by-username-query="select u.username, a.authority from users u inner join 
+	(select user_id, authority from users_authorities ua inner join authorities a on a.id=ua.auth_id) a
+	on u.id=a.user_id where u.username=?" />
+	<!--
+	select u.username, a.authority from users u inner join 
+	(select user_id, authority from users_authorities ua inner join authorities a on a.id=ua.auth_id) a
+	on u.id=a.user_id
+	where u.username='admin'; 
+	 -->
+</beans:beans>
